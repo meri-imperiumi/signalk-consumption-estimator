@@ -260,17 +260,58 @@ test.describe("Plugin lifecycle", () => {
     const units = Object.fromEntries(meta.map((m) => [m.path, m.value.units]));
     assert.strictEqual(
       units["tanks.freshWater.water.prediction.consumption24h"],
-      "l/day",
+      "m3/s",
     );
     assert.strictEqual(
       units["tanks.freshWater.water.prediction.remaining24h"],
-      "l",
+      "m3",
     );
     assert.strictEqual(
       units["tanks.freshWater.water.prediction.level24h"],
       "ratio",
     );
 
+    await plugin.stop();
+  });
+
+  test("preserves publication precision and zero values in SI units", async () => {
+    const app = new FakeSignalKApp();
+    app.dataPath = await newDataDir();
+    const plugin = makePlugin(app);
+    await plugin.start(TEST_CONFIG);
+    const internals = plugin.__getInternals();
+    const est = internals.estimators[0];
+    const base = "tanks.freshWater.water.prediction";
+
+    // Isolate publication from learning with a fractional liters-based prediction.
+    for (const liters of [100, null]) {
+      est.predict = () => ({
+        liters,
+        rate: 1.234,
+        remaining24h: liters == null ? null : 98.766,
+        level24h: liters == null ? null : 0.395064,
+      });
+      internals.runCycle();
+      assert.strictEqual(
+        lastValue(app, `${base}.consumption24h`),
+        1.23 / 86400000,
+      );
+      assert.strictEqual(
+        lastValue(app, `${base}.remaining24h`),
+        liters == null ? null : 0.0988,
+      );
+      assert.strictEqual(
+        lastValue(app, `${base}.level24h`),
+        liters == null ? null : 0.395,
+      );
+    }
+
+    est.predict = () => ({ liters: 0, rate: 0, remaining24h: 0, level24h: 0 });
+    internals.runCycle();
+    assert.strictEqual(lastValue(app, `${base}.consumption24h`), 0);
+    assert.strictEqual(lastValue(app, `${base}.remaining24h`), 0);
+    assert.strictEqual(lastValue(app, `${base}.level24h`), 0);
+    assert.deepStrictEqual(app.errors, []);
     await plugin.stop();
   });
 
@@ -300,8 +341,8 @@ test.describe("Plugin lifecycle", () => {
     internals.runCycle();
 
     const base = "tanks.freshWater.water.prediction";
-    assert.strictEqual(lastValue(app, `${base}.consumption24h`), 24);
-    assert.strictEqual(lastValue(app, `${base}.remaining24h`), 152);
+    assert.strictEqual(lastValue(app, `${base}.consumption24h`), 24 / 86400000);
+    assert.strictEqual(lastValue(app, `${base}.remaining24h`), 0.152);
     // capacity 250 l from the capacity path
     assert.strictEqual(lastValue(app, `${base}.level24h`), 0.608);
     assert.strictEqual(internals.resolveCrewCount(), 2);
@@ -338,8 +379,8 @@ test.describe("Plugin lifecycle", () => {
 
     const base = "tanks.freshWater.water.prediction";
     // 50 l remaining, default rate 6 l/day for 1 crew
-    assert.strictEqual(lastValue(app, `${base}.consumption24h`), 6);
-    assert.strictEqual(lastValue(app, `${base}.remaining24h`), 44);
+    assert.strictEqual(lastValue(app, `${base}.consumption24h`), 6 / 86400000);
+    assert.strictEqual(lastValue(app, `${base}.remaining24h`), 0.044);
     assert.strictEqual(lastValue(app, `${base}.level24h`), 0.22);
 
     await plugin.stop();
@@ -355,7 +396,7 @@ test.describe("Plugin lifecycle", () => {
     const base = "tanks.freshWater.water.prediction";
     // Volume-dependent predictions stay null, but the rate (default fallback
     // for the default 2 crew) is still published
-    assert.strictEqual(lastValue(app, `${base}.consumption24h`), 12);
+    assert.strictEqual(lastValue(app, `${base}.consumption24h`), 12 / 86400000);
     assert.strictEqual(lastValue(app, `${base}.remaining24h`), null);
     assert.strictEqual(lastValue(app, `${base}.level24h`), null);
     const status = app.setPluginStatusCalls.at(-1);
@@ -377,7 +418,7 @@ test.describe("Plugin lifecycle", () => {
     internals.runCycle();
 
     const base = "tanks.freshWater.water.prediction";
-    assert.strictEqual(lastValue(app, `${base}.consumption24h`), 12);
+    assert.strictEqual(lastValue(app, `${base}.consumption24h`), 12 / 86400000);
     assert.strictEqual(lastValue(app, `${base}.remaining24h`), null);
     assert.strictEqual(lastValue(app, `${base}.level24h`), null);
     const status = app.setPluginStatusCalls.at(-1);
@@ -418,7 +459,7 @@ test.describe("Plugin lifecycle", () => {
     // One learning sample so far: bin exists but below minSamples (3),
     // so the rate is still the default and the status shows warming up
     const base = "tanks.freshWater.water.prediction";
-    assert.strictEqual(lastValue(app, `${base}.consumption24h`), 12);
+    assert.strictEqual(lastValue(app, `${base}.consumption24h`), 12 / 86400000);
     const status = app.setPluginStatusCalls.at(-1);
     assert.ok(status.includes("crew 2 warming up (1/3)"));
 
@@ -504,6 +545,66 @@ test.describe("Plugin lifecycle", () => {
 
     await plugin.stop();
   });
+
+  for (const volumeAvailable of [true, false]) {
+    test(`anomaly rates stay in liters/day with volume ${volumeAvailable ? "available" : "unavailable"}`, async (t) => {
+      const app = new FakeSignalKApp();
+      app.dataPath = await newDataDir();
+      const plugin = makePlugin(app);
+      await plugin.start({
+        ...TEST_CONFIG,
+        tanks: [TEST_CONFIG.tanks[0]],
+      });
+      t.after(() => plugin.stop());
+      const internals = plugin.__getInternals();
+      const est = internals.estimators[0];
+      const base = "tanks.freshWater.water.prediction";
+      const notePath = `notifications.${base}.consumption`;
+      // Seed a learned 15 l/day baseline. Reusing the timestamp below
+      // prevents new learning while exercising publication and notifications.
+      est.learner.update({ crewCount: 2, intervalHours: 24, liters: 15 });
+      emitSample(app, T0, {
+        ...(volumeAvailable ? { remaining: 1, capacity: 1 } : {}),
+        crew: ["a", "b"],
+      });
+      est.shortRate = 15;
+      internals.runCycle();
+      assert.strictEqual(lastValue(app, notePath), undefined);
+      assert.strictEqual(
+        lastValue(app, `${base}.consumption24h`),
+        15 / 86400000,
+      );
+      assert.strictEqual(
+        lastValue(app, `${base}.remaining24h`),
+        volumeAvailable ? 0.985 : null,
+      );
+
+      // Exactly 2x must persist for two cycles before raising.
+      est.shortRate = 30;
+      internals.runCycle();
+      assert.strictEqual(lastValue(app, notePath), undefined);
+      internals.runCycle();
+      assert.strictEqual(lastValue(app, notePath).state, "warn");
+      assert.strictEqual(
+        lastValue(app, notePath).message,
+        `${est.name} consumption 2.0x predicted (30 l/day vs 15 l/day)`,
+      );
+
+      // Hysteresis retains the warning at factor / 1.5, then clears below it.
+      est.shortRate = 20;
+      internals.runCycle();
+      assert.strictEqual(lastValue(app, notePath).state, "warn");
+      est.shortRate = 19;
+      internals.runCycle();
+      assert.strictEqual(lastValue(app, notePath).state, "normal");
+      assert.strictEqual(est.learnedRate(2), 15);
+      assert.strictEqual(
+        lastValue(app, `${base}.consumption24h`),
+        15 / 86400000,
+      );
+      assert.deepStrictEqual(app.errors, []);
+    });
+  }
 
   test("notification disabled in config raises nothing", async () => {
     const app = new FakeSignalKApp();
