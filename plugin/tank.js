@@ -26,18 +26,26 @@ const CAPACITY_LEVEL_MAX = 0.98;
 /** EMA smoothing for capacity inference. */
 const CAPACITY_ALPHA = 0.1;
 
-/** A rise larger than both of these is treated as a refill. */
-const REFILL_MIN_LITERS = 0.5;
-const REFILL_CAPACITY_FRACTION = 0.03;
+/**
+ * Minimum change (liters) treated as a real tank movement. Smaller
+ * changes in either direction are sensor noise.
+ */
+const CHANGE_MIN_LITERS = 0.5;
 
-/** Typical canister size for heuristic refill inference. */
-const TYPICAL_REFILL_LITERS = 10;
+/**
+ * Noise band as a fraction of tank capacity: level senders bounce by a
+ * few percent with heel, waves, and temperature. Changes within the
+ * band (in either direction) hold the anchor, so sub-band consumption
+ * accumulates and is learned once it crosses the band.
+ */
+const CHANGE_CAPACITY_FRACTION = 0.03;
 
-/** Maximum inferred consumption during a refill (liters). */
-const MAX_INFERRED_CONSUMPTION = TYPICAL_REFILL_LITERS * 0.5;
-
-/** Consumption below this over an interval reads as zero (sensor noise). */
-const NOISE_LITERS = 0.05;
+/**
+ * After this many hours without a confirmed tank movement the tank
+ * demonstrably consumes less than the noise band per day, and the
+ * short-term rate is decayed toward zero.
+ */
+const QUIET_DECAY_HOURS = 24;
 
 /** Fast EMA for the short-term observed rate. */
 const DEFAULT_SHORT_ALPHA = 0.3;
@@ -135,6 +143,15 @@ class TankEstimator {
 
     /** @type {number|null} */
     this.shortRate = null;
+
+    /**
+     * First sample beyond the noise band awaiting confirmation by the
+     * next sample: `{kind: "rise"|"drop"}|null`. Single-sample spikes
+     * (sloshing) are discarded instead of learned.
+     *
+     * @type {{kind: "rise"|"drop"}|null}
+     */
+    this.pending = null;
   }
 
   /**
@@ -148,8 +165,30 @@ class TankEstimator {
   }
 
   /**
+   * Folds an observed rate into the short-term EMA.
+   *
+   * @param {number} observedRate
+   * @returns {void}
+   */
+  updateShortRate(observedRate) {
+    this.shortRate =
+      this.shortRate == null
+        ? observedRate
+        : this.shortAlpha * observedRate +
+          (1 - this.shortAlpha) * this.shortRate;
+  }
+
+  /**
    * Processes a tank sample: infers capacity, detects refills, and learns
-   * the consumption over the interval since the previous sample.
+   * the consumption over the interval since the previous confirmed
+   * movement.
+   *
+   * Sensor noise is rejected with a symmetric deadband plus confirmation:
+   * changes within `max(CHANGE_MIN_LITERS, CHANGE_CAPACITY_FRACTION ×
+   * capacity)` hold the anchor (sub-band consumption accumulates until
+   * it crosses the band), and a change beyond the band only counts once
+   * the next sample confirms the same direction. This keeps sloshing and
+   * single-sample spikes from being learned as consumption or refills.
    *
    * @param {object} sample
    * @param {number|null} sample.remaining - Remaining liters (primary source)
@@ -159,7 +198,8 @@ class TankEstimator {
    * @param {number|null} sample.crewCount - Crew on board at sample time
    * @param {number} sample.timestamp - Sample time (epoch ms)
    * @param {boolean} [sample.skipLearning=false] - Skip learning this sample
-   * @returns {{status: "learned"|"refill"|"skipped"|"insufficient",
+   *        (e.g. while under way); also freezes the short-term rate
+   * @returns {{status: "learned"|"refill"|"noise"|"pending"|"skipped"|"insufficient",
    *            observedRate: number|null, learned: boolean}}
    */
   processSample({
@@ -241,57 +281,73 @@ class TankEstimator {
     }
 
     const anchor = this.anchor;
-    this.anchor = { liters, time: timestamp, source };
-
     if (anchor == null || anchor.source !== source) {
+      // First sample, or the volume source changed (e.g. `remaining` went
+      // away and `level` took over): the liter scales are not comparable,
+      // so re-anchor without learning
+      this.anchor = { liters, time: timestamp, source };
+      this.pending = null;
       return { status: "skipped", observedRate: null, learned: false };
     }
 
     const intervalHours = (timestamp - anchor.time) / 3600000;
-    if (
-      !Number.isFinite(intervalHours) ||
-      intervalHours < MIN_INTERVAL_HOURS ||
-      intervalHours > MAX_INTERVAL_HOURS
-    ) {
+    if (!Number.isFinite(intervalHours) || intervalHours < MIN_INTERVAL_HOURS) {
+      // Too soon since the anchor to judge a change; keep anchor and any
+      // pending confirmation so a fast sender cannot fragment intervals
+      return { status: "skipped", observedRate: null, learned: false };
+    }
+    if (intervalHours > MAX_INTERVAL_HOURS) {
+      // Interval too long (server off, tank unmonitored) to attribute to
+      // current behavior; re-anchor without learning
+      this.anchor = { liters, time: timestamp, source };
+      this.pending = null;
       return { status: "skipped", observedRate: null, learned: false };
     }
 
-    const delta = liters - anchor.liters;
-    const refillThreshold = Math.max(
-      REFILL_MIN_LITERS,
-      cap != null ? REFILL_CAPACITY_FRACTION * cap : 0,
+    const band = Math.max(
+      CHANGE_MIN_LITERS,
+      cap != null && cap > 0 ? CHANGE_CAPACITY_FRACTION * cap : 0,
     );
+    const delta = liters - anchor.liters;
 
-    let consumed = 0;
-    let isRefill = delta > refillThreshold;
-
-    if (isRefill) {
-      // Tank increased - likely a refill. But consumption may have
-      // occurred during the interval (e.g., drank 3L then added 10L canister).
-      // Infer minimum consumption by assuming refills are typically
-      // in TYPICAL_REFILL_LITERS increments. If delta is less than that,
-      // the difference is inferred consumption.
-      if (delta < TYPICAL_REFILL_LITERS && cap != null) {
-        const inferred = TYPICAL_REFILL_LITERS - delta;
-        // Cap the inferred amount to avoid over-estimation
-        consumed = Math.min(inferred, MAX_INFERRED_CONSUMPTION);
-        // Verify the inferred consumption is physically possible
-        // (anchor - consumed + refill <= capacity)
-        if (anchor.liters - consumed + delta <= cap) {
-          isRefill = false; // We'll learn from this
-        } else {
-          consumed = 0; // Skip learning if numbers don't make sense
-        }
+    if (Math.abs(delta) <= band) {
+      // Inside the noise band: hold the anchor so sub-band consumption
+      // accumulates, and discard any pending confirmation. After a full
+      // day without a confirmed movement the observed rate is by
+      // definition below the band, so decay the short-term rate.
+      this.pending = null;
+      if (!skipLearning && intervalHours >= QUIET_DECAY_HOURS) {
+        this.updateShortRate(0);
       }
-      if (isRefill) {
-        // Genuine refill (or can't infer consumption)
-        return { status: "refill", observedRate: null, learned: false };
-      }
-    } else {
-      consumed = Math.max(0, -delta);
+      return { status: "noise", observedRate: 0, learned: false };
     }
-    const observedRate =
-      consumed < NOISE_LITERS ? 0 : (consumed / intervalHours) * 24;
+
+    const kind = delta > 0 ? "rise" : "drop";
+    if (this.pending == null || this.pending.kind !== kind) {
+      // First sample beyond the band in this direction: wait for the next
+      // sample to confirm, so single-sample spikes are not learned
+      this.pending = { kind };
+      return { status: "pending", observedRate: null, learned: false };
+    }
+
+    // Confirmed by two consecutive samples beyond the band in the same
+    // direction: re-anchor and act on the full movement
+    this.pending = null;
+    this.anchor = { liters, time: timestamp, source };
+
+    if (kind === "rise") {
+      // Refill: consumption during the interval cannot be separated from
+      // the amount added, so don't learn. Under-estimating is safer than
+      // inventing consumption (the old canister-inference heuristic did
+      // exactly that on upward sensor noise).
+      return { status: "refill", observedRate: null, learned: false };
+    }
+
+    const consumed = -delta;
+    const observedRate = Math.min(
+      this.learner.maxRate,
+      (consumed / intervalHours) * 24,
+    );
 
     const learned =
       !skipLearning &&
@@ -302,11 +358,9 @@ class TankEstimator {
         timestamp,
       });
 
-    this.shortRate =
-      this.shortRate == null
-        ? observedRate
-        : this.shortAlpha * observedRate +
-          (1 - this.shortAlpha) * this.shortRate;
+    if (!skipLearning) {
+      this.updateShortRate(observedRate);
+    }
 
     return { status: "learned", observedRate, learned };
   }
@@ -390,6 +444,7 @@ class TankEstimator {
       capacitySamples: this.capacitySamples,
       lastSeen: this.lastSeen,
       anchor: this.anchor,
+      pending: this.pending,
       shortRate: this.shortRate,
       learner: this.learner.toJSON(),
     };
@@ -441,6 +496,15 @@ class TankEstimator {
     if (typeof data.shortRate === "number" && Number.isFinite(data.shortRate)) {
       this.shortRate = data.shortRate;
     }
+    if (
+      data.pending != null &&
+      typeof data.pending === "object" &&
+      (data.pending.kind === "rise" || data.pending.kind === "drop")
+    ) {
+      this.pending = { kind: data.pending.kind };
+    } else {
+      this.pending = null;
+    }
     if (data.lastSeen != null && typeof data.lastSeen === "object") {
       const ls = data.lastSeen;
       if (ls.remaining == null || Number.isFinite(ls.remaining)) {
@@ -462,11 +526,9 @@ class TankEstimator {
 module.exports = {
   TankEstimator,
   DEFAULT_SHORT_ALPHA,
-  NOISE_LITERS,
-  REFILL_MIN_LITERS,
-  REFILL_CAPACITY_FRACTION,
-  TYPICAL_REFILL_LITERS,
-  MAX_INFERRED_CONSUMPTION,
+  CHANGE_MIN_LITERS,
+  CHANGE_CAPACITY_FRACTION,
+  QUIET_DECAY_HOURS,
   MIN_INTERVAL_HOURS,
   MAX_INTERVAL_HOURS,
 };

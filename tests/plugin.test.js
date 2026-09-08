@@ -290,7 +290,7 @@ test.describe("Plugin lifecycle", () => {
     });
     internals.runCycle();
 
-    // 24 h later: 24 l consumed → 24 l/day
+    // 24 h later: 24 l consumed — below the noise band, awaits confirmation
     emitSample(app, T0 + 24 * HOUR, {
       remaining: 0.176,
       level: 0.704,
@@ -299,11 +299,20 @@ test.describe("Plugin lifecycle", () => {
     });
     internals.runCycle();
 
+    // 48 h: the drop is confirmed — 48 l over 48 h → 24 l/day
+    emitSample(app, T0 + 48 * HOUR, {
+      remaining: 0.152,
+      level: 0.608,
+      capacity: 0.25,
+      crew: ["a", "b"],
+    });
+    internals.runCycle();
+
     const base = "tanks.freshWater.water.prediction";
     assert.strictEqual(lastValue(app, `${base}.consumption24h`), 24);
-    assert.strictEqual(lastValue(app, `${base}.remaining24h`), 152);
+    assert.strictEqual(lastValue(app, `${base}.remaining24h`), 128);
     // capacity 250 l from the capacity path
-    assert.strictEqual(lastValue(app, `${base}.level24h`), 0.608);
+    assert.strictEqual(lastValue(app, `${base}.level24h`), 0.512);
     assert.strictEqual(internals.resolveCrewCount(), 2);
     assert.strictEqual(internals.estimators[0].learner.getRate(2), 24);
 
@@ -414,6 +423,14 @@ test.describe("Plugin lifecycle", () => {
       crew: ["a", "b"],
     });
     internals.runCycle();
+    t += 24 * HOUR;
+    emitSample(app, t, {
+      remaining: 0.152,
+      level: 0.608,
+      capacity: 0.25,
+      crew: ["a", "b"],
+    });
+    internals.runCycle();
 
     // One learning sample so far: bin exists but below minSamples (3),
     // so the rate is still the default and the status shows warming up
@@ -455,7 +472,7 @@ test.describe("Plugin lifecycle", () => {
     const app = new FakeSignalKApp();
     app.dataPath = await newDataDir();
     const plugin = makePlugin(app);
-    // Big tank (1000 l) so high consumption can run for days
+    // Big tank (1000 l) so high consumption can run for days. Volumes in m3.
     await plugin.start({
       ...TEST_CONFIG,
       tanks: [TEST_CONFIG.tanks[0]],
@@ -465,17 +482,25 @@ test.describe("Plugin lifecycle", () => {
     const notePath =
       "notifications.tanks.freshWater.water.prediction.consumption";
 
-    // Anchor + learn a calm baseline of 24 l/day (volumes in m3)
+    // Learn a calm baseline of 24 l/day. Noise band is 3% of 1000 l =
+    // 30 l, so daily drops of 24 l only register once accumulated:
+    // anchor, noise, pending, confirmed 72 l over 72 h
     let t = T0;
     emitSample(app, t, { remaining: 1, capacity: 1, crew: ["a", "b"] });
     internals.runCycle();
     t += 24 * HOUR;
     emitSample(app, t, { remaining: 0.976, capacity: 1, crew: ["a", "b"] });
     internals.runCycle();
-    assert.strictEqual(internals.estimators[0].shortRate, 24);
+    t += 24 * HOUR;
+    emitSample(app, t, { remaining: 0.952, capacity: 1, crew: ["a", "b"] });
+    internals.runCycle();
+    t += 24 * HOUR;
+    emitSample(app, t, { remaining: 0.928, capacity: 1, crew: ["a", "b"] });
+    internals.runCycle();
+    assert.strictEqual(internals.estimators[0].learner.getRate(2), 24);
 
-    // Sustained high consumption: 96 l/day (1000 → 976 → 880 → 784 → 688 → 592)
-    for (const remaining of [0.88, 0.784, 0.688, 0.592]) {
+    // Sustained high consumption: 200 l/day, confirmed every second day
+    for (const remaining of [0.728, 0.528, 0.328, 0.128, 0.008]) {
       t += 24 * HOUR;
       emitSample(app, t, { remaining, capacity: 1, crew: ["a", "b"] });
       internals.runCycle();
@@ -485,17 +510,11 @@ test.describe("Plugin lifecycle", () => {
     assert.strictEqual(raised.state, "warn");
     assert.ok(raised.message.includes("predicted"));
 
-    // Recovery: back to 24 l/day until the short rate decays below
-    // the clear threshold (factor / 1.5)
-    let remaining = 592;
-    for (let day = 0; day < 8; day++) {
-      remaining -= 24;
+    // Recovery: consumption stops (readings stay put inside the noise
+    // band), the short rate decays and the notification clears
+    for (let day = 0; day < 6; day++) {
       t += 24 * HOUR;
-      emitSample(app, t, {
-        remaining: remaining / 1000,
-        capacity: 1,
-        crew: ["a", "b"],
-      });
+      emitSample(app, t, { remaining: 0.008, capacity: 1, crew: ["a", "b"] });
       internals.runCycle();
     }
     const cleared = lastValue(app, notePath);
@@ -523,10 +542,22 @@ test.describe("Plugin lifecycle", () => {
     emitSample(app, t, { remaining: 0.976, capacity: 1, crew: ["a", "b"] });
     internals.runCycle();
     t += 24 * HOUR;
-    emitSample(app, t, { remaining: 0.88, capacity: 1, crew: ["a", "b"] });
+    emitSample(app, t, { remaining: 0.952, capacity: 1, crew: ["a", "b"] });
     internals.runCycle();
     t += 24 * HOUR;
-    emitSample(app, t, { remaining: 0.784, capacity: 1, crew: ["a", "b"] });
+    emitSample(app, t, { remaining: 0.928, capacity: 1, crew: ["a", "b"] });
+    internals.runCycle();
+    t += 24 * HOUR;
+    emitSample(app, t, { remaining: 0.728, capacity: 1, crew: ["a", "b"] });
+    internals.runCycle();
+    t += 24 * HOUR;
+    emitSample(app, t, { remaining: 0.528, capacity: 1, crew: ["a", "b"] });
+    internals.runCycle();
+    t += 24 * HOUR;
+    emitSample(app, t, { remaining: 0.328, capacity: 1, crew: ["a", "b"] });
+    internals.runCycle();
+    t += 24 * HOUR;
+    emitSample(app, t, { remaining: 0.128, capacity: 1, crew: ["a", "b"] });
     internals.runCycle();
 
     const notePath =
@@ -553,6 +584,13 @@ test.describe("Plugin lifecycle", () => {
     emitSample(app, T0 + 24 * HOUR, {
       remaining: 0.176,
       level: 0.704,
+      capacity: 0.25,
+      crew: ["a", "b"],
+    });
+    internals.runCycle();
+    emitSample(app, T0 + 48 * HOUR, {
+      remaining: 0.152,
+      level: 0.608,
       capacity: 0.25,
       crew: ["a", "b"],
     });
@@ -614,7 +652,8 @@ test.describe("Plugin lifecycle", () => {
     await plugin.start(TEST_CONFIG);
     const internals = plugin.__getInternals();
 
-    // First learning cycle (stationary)
+    // First learning cycles (stationary): anchor, pending, confirmed
+    // 48 l over 48 h → 24 l/day
     let t = T0;
     emitSample(app, t, {
       remaining: 0.2,
@@ -631,10 +670,19 @@ test.describe("Plugin lifecycle", () => {
       crew: ["a", "b"],
     });
     internals.runCycle();
+    t += 24 * HOUR;
+    emitSample(app, t, {
+      remaining: 0.152,
+      level: 0.608,
+      capacity: 0.25,
+      crew: ["a", "b"],
+    });
+    internals.runCycle();
 
     const est = internals.estimators[0];
     // Learned 24 l/day for 2 crew
     assert.strictEqual(est.learner.getRate(2), 24);
+    assert.strictEqual(est.shortRate, 24);
 
     // Now set boat to "sailing" state
     app.pathValues.set("navigation.state", "sailing");
@@ -647,11 +695,20 @@ test.describe("Plugin lifecycle", () => {
       ],
     });
 
-    // Emit a sample while sailing - should not learn
+    // Emit samples while sailing: confirmed drops are observed but not
+    // learned, and the short-term rate stays frozen
     t += 24 * HOUR;
     emitSample(app, t, {
-      remaining: 0.152,
-      level: 0.608,
+      remaining: 0.128,
+      level: 0.512,
+      capacity: 0.25,
+      crew: ["a", "b"],
+    });
+    internals.runCycle();
+    t += 24 * HOUR;
+    emitSample(app, t, {
+      remaining: 0.104,
+      level: 0.416,
       capacity: 0.25,
       crew: ["a", "b"],
     });
@@ -659,6 +716,7 @@ test.describe("Plugin lifecycle", () => {
 
     // Rate should still be 24 (unchanged because learning was skipped)
     assert.strictEqual(est.learner.getRate(2), 24);
+    assert.strictEqual(est.shortRate, 24);
 
     // Set boat back to stationary (anchored)
     app.pathValues.set("navigation.state", "anchored");
@@ -674,8 +732,16 @@ test.describe("Plugin lifecycle", () => {
     // Now learning should work again
     t += 24 * HOUR;
     emitSample(app, t, {
-      remaining: 0.128,
-      level: 0.512,
+      remaining: 0.08,
+      level: 0.32,
+      capacity: 0.25,
+      crew: ["a", "b"],
+    });
+    internals.runCycle();
+    t += 24 * HOUR;
+    emitSample(app, t, {
+      remaining: 0.056,
+      level: 0.224,
       capacity: 0.25,
       crew: ["a", "b"],
     });
@@ -684,6 +750,68 @@ test.describe("Plugin lifecycle", () => {
     // Rate should have updated (still near 24, with EMA smoothing)
     const rate = est.learner.getRate(2);
     assert(rate > 23 && rate < 25, `rate should be ~24, got ${rate}`);
+
+    await plugin.stop();
+  });
+
+  test("does not raise notifications from under-way sloshing", async () => {
+    const app = new FakeSignalKApp();
+    app.dataPath = await newDataDir();
+    const plugin = makePlugin(app);
+    await plugin.start(TEST_CONFIG);
+    const internals = plugin.__getInternals();
+
+    // Learn a stationary baseline of 24 l/day
+    let t = T0;
+    emitSample(app, t, {
+      remaining: 0.2,
+      capacity: 0.25,
+      crew: ["a", "b"],
+    });
+    internals.runCycle();
+    t += 24 * HOUR;
+    emitSample(app, t, {
+      remaining: 0.176,
+      capacity: 0.25,
+      crew: ["a", "b"],
+    });
+    internals.runCycle();
+    t += 24 * HOUR;
+    emitSample(app, t, {
+      remaining: 0.152,
+      capacity: 0.25,
+      crew: ["a", "b"],
+    });
+    internals.runCycle();
+
+    const est = internals.estimators[0];
+    assert.strictEqual(est.learner.getRate(2), 24);
+
+    // Under way, the tank reading sloshes ±38 l around 152 l (noise
+    // band is 3% of 250 l ≈ 7.5 l). Neither learning nor the anomaly
+    // check may react to this.
+    app.pathValues.set("navigation.state", "sailing");
+    app.subscriptionmanager.emitDelta({
+      updates: [
+        {
+          values: [{ path: "navigation.state", value: "sailing" }],
+          timestamp: new Date(t).toISOString(),
+        },
+      ],
+    });
+
+    const slosh = [0.19, 0.15, 0.19, 0.15, 0.185, 0.15, 0.19, 0.15];
+    for (const remaining of slosh) {
+      t += HOUR;
+      emitSample(app, t, { remaining, capacity: 0.25, crew: ["a", "b"] });
+      internals.runCycle();
+    }
+
+    assert.strictEqual(est.learner.getRate(2), 24);
+    assert.strictEqual(est.shortRate, 24);
+    const notePath =
+      "notifications.tanks.freshWater.water.prediction.consumption";
+    assert.strictEqual(lastValue(app, notePath), undefined);
 
     await plugin.stop();
   });

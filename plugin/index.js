@@ -886,7 +886,17 @@ module.exports = (app) => {
           });
         }
 
-        checkAnomaly(est, crewCount);
+        if (underWay) {
+          // Suppress the anomaly check under way: motion makes tank
+          // readings fluctuate, the short-term rate is frozen, and the
+          // learning was already skipped for the same reason
+          const noteState = noteStates.get(est.id);
+          if (noteState) {
+            noteState.cycles = 0;
+          }
+        } else {
+          checkAnomaly(est, crewCount);
+        }
       }
       updateStatus();
     } catch (error) {
