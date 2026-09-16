@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Tank delta subscriptions are now rate-limited: the plugin asks the
+  Signal K server for at most one delivery per third of the update
+  interval (minimum 30 s) per tank path, instead of receiving every
+  sensor update. Tank senders often publish at 1 Hz or faster, but the
+  estimator only samples on its update cycle and needs just the
+  freshest value — a 1 Hz stream is cut by more than 99%, reducing the
+  plugin's per-delta footprint on loaded servers. Crew and navigation
+  state changes are rare and stay unthrottled
+
 ## [0.4.0] - 2026-09-08
 
 ### Fixed

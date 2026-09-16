@@ -274,6 +274,51 @@ test.describe("Plugin lifecycle", () => {
     await plugin.stop();
   });
 
+  test("rate-limits tank subscriptions to reduce delta load", async () => {
+    const app = new FakeSignalKApp();
+    app.dataPath = await newDataDir();
+    const plugin = makePlugin(app);
+    await plugin.start(TEST_CONFIG);
+
+    const entries =
+      app.subscriptionmanager.subscriptions[0].subscription.subscribe;
+    const byPath = Object.fromEntries(entries.map((s) => [s.path, s]));
+
+    // Tank paths: instant policy, at most one delivery per third of
+    // the 15 min update cycle
+    for (const path of [
+      "tanks.freshWater.water.currentLevel",
+      "tanks.freshWater.water.remaining",
+      "tanks.freshWater.water.capacity",
+    ]) {
+      assert.strictEqual(byPath[path].policy, "instant");
+      assert.strictEqual(byPath[path].minPeriod, 300000);
+    }
+
+    // Rare event paths are delivered unthrottled
+    assert.strictEqual(byPath["communication.crewNames"].minPeriod, undefined);
+    assert.strictEqual(byPath["navigation.state"].minPeriod, undefined);
+
+    await plugin.stop();
+  });
+
+  test("floors the tank delivery period for very short update intervals", async () => {
+    const app = new FakeSignalKApp();
+    app.dataPath = await newDataDir();
+    const plugin = makePlugin(app);
+    await plugin.start({ ...TEST_CONFIG, updateIntervalMinutes: 0.001 });
+
+    const entries =
+      app.subscriptionmanager.subscriptions[0].subscription.subscribe;
+    for (const entry of entries) {
+      if (entry.path.startsWith("tanks.")) {
+        assert.strictEqual(entry.minPeriod, 30000);
+      }
+    }
+
+    await plugin.stop();
+  });
+
   test("learns consumption and publishes predictions", async () => {
     const app = new FakeSignalKApp();
     app.dataPath = await newDataDir();

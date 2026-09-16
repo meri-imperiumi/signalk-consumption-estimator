@@ -88,6 +88,17 @@ const UNDER_WAY_STATES = ["sailing", "motoring", "under way"];
 const INITIAL_CYCLE_DELAY_MS = 5000;
 
 /**
+ * Fraction of the update cycle used as the minimum period between
+ * server deliveries of tank path deltas.
+ */
+const SUBSCRIPTION_CYCLE_FRACTION = 3;
+
+/**
+ * Floor for the tank delta delivery minimum period (milliseconds).
+ */
+const MIN_DELIVERY_PERIOD_MS = 30000;
+
+/**
  * Unwraps a Signal K value that may be a plain number or wrapped in an
  * object with a `value` field.
  *
@@ -980,22 +991,45 @@ module.exports = (app) => {
   }
 
   /**
-   * Subscribes to the tank and crew paths.
+   * Minimum milliseconds between server deliveries of a tank path
+   * delta. Tank senders often update at 1 Hz or faster, but the
+   * estimator samples on its update cycle and needs only the freshest
+   * value: a third of the cycle (floored at 30 s) cuts a 1 Hz stream by
+   * more than 99% while keeping every cycle's cached values recent.
+   *
+   * @returns {number}
+   */
+  function tankDeliveryMinPeriod() {
+    const cycleMs = pluginConfig.updateIntervalMinutes * 60000;
+    return Math.round(
+      Math.max(cycleMs / SUBSCRIPTION_CYCLE_FRACTION, MIN_DELIVERY_PERIOD_MS),
+    );
+  }
+
+  /**
+   * Subscribes to the tank and crew paths. Tank deliveries are
+   * rate-limited (see `tankDeliveryMinPeriod`) so per-second sensor
+   * updates don't add per-delta load on the server. Crew and navigation
+   * state are rare, promptly relevant events and are delivered
+   * unthrottled.
    *
    * @returns {void}
    */
   function subscribeToDeltas() {
-    const paths = new Set([CREW_PATH, NAV_STATE_PATH]);
+    const tankPaths = new Set();
     for (const est of estimators) {
-      paths.add(est.levelPath);
-      paths.add(est.remainingPath);
-      paths.add(est.capacityPath);
+      tankPaths.add(est.levelPath);
+      tankPaths.add(est.remainingPath);
+      tankPaths.add(est.capacityPath);
     }
-    subscribedPaths = paths;
+    subscribedPaths = new Set([CREW_PATH, NAV_STATE_PATH, ...tankPaths]);
 
+    const minPeriod = tankDeliveryMinPeriod();
     const subscription = {
       context: "vessels.self",
-      subscribe: Array.from(paths).map((path) => ({ path })),
+      subscribe: Array.from(subscribedPaths, (path) =>
+        tankPaths.has(path) ? { path, policy: "instant", minPeriod } : { path },
+      ),
     };
 
     app.subscriptionmanager.subscribe(
@@ -1012,7 +1046,9 @@ module.exports = (app) => {
         }
       },
     );
-    app.debug(`Subscribed to ${paths.size} paths`);
+    app.debug(
+      `Subscribed to ${subscribedPaths.size} paths, tank deltas at most every ${minPeriod} ms`,
+    );
   }
 
   /** @type {Plugin} */
