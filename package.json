@@ -24,7 +24,7 @@
   "signalk-plugin-enabled-by-default": false,
   "signalk": {
     "displayName": "Water Consumption Estimator",
-    "appIcon": "./doc/icon.png"
+    "appIcon": "./doc/icon-256.png"
   },
   "engines": {
     "node": ">=22.0.0"
